@@ -45,6 +45,7 @@ class FlowLMConfig(StrictModel):
     # conditioning
     lookup_table: LookupTable
     weights_path: str | None = None
+    insert_bos_before_voice: bool = False
 
 
 # SEANet configuration
@@ -101,6 +102,8 @@ class MimiConfig(StrictModel):
     # Quantizer
     quantizer: QuantizerConfig
     weights_path: str | None = None
+    inner_dim: int | None = None
+    outer_dim: int | None = None
 
 
 class Config(StrictModel):

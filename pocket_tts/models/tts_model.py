@@ -91,7 +91,9 @@ class TTSModel(nn.Module):
         cls, config: Config, temp, lsd_decode_steps, noise_clamp: float | None, eos_threshold
     ) -> Self:
         flow_lm = FlowLMModel.from_pydantic_config(
-            config.flow_lm, latent_dim=config.mimi.quantizer.dimension
+            config.flow_lm,
+            latent_dim=config.mimi.quantizer.dimension,
+            insert_bos_before_voice=config.flow_lm.insert_bos_before_voice,
         )
         tts_model = cls(flow_lm, temp, lsd_decode_steps, noise_clamp, eos_threshold, config)
         return tts_model
@@ -104,7 +106,13 @@ class TTSModel(nn.Module):
             config, temp, lsd_decode_steps, noise_clamp, eos_threshold
         )
         tts_model.flow_lm.speaker_proj_weight = torch.nn.Parameter(
-            torch.zeros((1024, 512), dtype=torch.float32)
+            torch.zeros(
+                (
+                    config.flow_lm.transformer.d_model,
+                    config.mimi.inner_dim or config.mimi.seanet.dimension,
+                ),
+                dtype=torch.float32,
+            )
         )
         if config.flow_lm.weights_path is not None:
             if config.mimi.weights_path is None:
@@ -137,6 +145,8 @@ class TTSModel(nn.Module):
             sample_rate=mimi_config["sample_rate"],
             frame_rate=mimi_config["frame_rate"],
             encoder_frame_rate=mimi_config["sample_rate"] / encoder.hop_length,
+            inner_dim=mimi_config["inner_dim"],
+            outer_dim=mimi_config["outer_dim"],
             encoder_transformer=encoder_transformer,
             decoder_transformer=decoder_transformer,
         ).to(device="cpu")
@@ -792,6 +802,9 @@ class TTSModel(nn.Module):
 
         with display_execution_time("Encoding audio prompt"):
             prompt = self._encode_audio(audio_conditioning.unsqueeze(0).to(self.device))
+
+        if self.flow_lm.insert_bos_before_voice:
+            prompt = torch.cat([self.flow_lm.bos_before_voice, prompt], dim=1)
 
         model_state = init_states(self.flow_lm, batch_size=1, sequence_length=prompt.shape[1])
 
