@@ -1,11 +1,15 @@
-import torch
-import torch.nn as nn
+from __future__ import annotations
+
+from max.dtype import DType
+from max.graph import DeviceRef, TensorValue, Weight
+from max.nn import Module
 
 
-class LayerScale(nn.Module):
-    def __init__(self, channels: int, init: float):
+class LayerScale(Module):
+    def __init__(self, channels: int, init: float, dtype: DType = DType.float32):
         super().__init__()
-        self.scale = nn.Parameter(torch.full((channels,), init))
+        del init  # only used at training time
+        self.scale = Weight("scale", dtype, [channels], device=DeviceRef.CPU())
 
-    def forward(self, x: torch.Tensor):
-        return self.scale * x
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return self.scale.cast(x.dtype) * x

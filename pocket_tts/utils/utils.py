@@ -4,10 +4,9 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import requests
-import torch
 from huggingface_hub import hf_hub_download
-from torch import nn
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 DEBUG_MIMI = os.environ.get("DEBUG_MIMI", "0") == "1"
@@ -47,21 +46,11 @@ def make_cache_directory() -> Path:
     return cache_dir
 
 
-def print_nb_parameters(model: nn.Module, model_name: str):
-    logger = logging.getLogger(__name__)
-    state_dict = model.state_dict()
-    total = 0
-    for key, value in state_dict.items():
-        logger.info("%s: %,d", key, value.numel())
-        total += value.numel()
-    logger.info("Total number of parameters in %s: %,d", model_name, total)
-
-
 def size_of_dict(state_dict: dict) -> int:
     total_size = 0
     for value in state_dict.values():
-        if isinstance(value, torch.Tensor):
-            total_size += value.numel() * value.element_size()
+        if isinstance(value, np.ndarray):
+            total_size += value.nbytes
         elif isinstance(value, dict):
             total_size += size_of_dict(value)
     return total_size

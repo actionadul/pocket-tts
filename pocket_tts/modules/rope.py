@@ -1,74 +1,91 @@
+"""Rotary positional embedding (RoPE).
+
+The math matches the legacy torch implementation in `apply_rope`.
+"""
+
+from __future__ import annotations
+
 import math
 
-import torch
-from torch import nn
+import numpy as np
+from max.dtype import DType
+from max.graph import DeviceRef, TensorValue, ops
+from max.nn import Module
 
 
-def apply_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    offset: int | torch.Tensor = 0,
-    max_period: int | float = 10_000,
-):
-    """
-    Args:
-        q (torch.Tensor): Queries, shape `[B, T, H, D]`.
-        k (torch.Tensor): Keys, shape `[B, T, H, D]`.
-        offset (int): Current offset, e.g. when streaming.
-        max_period (float): Maximum period for the cos and sin.
-    """
+class RotaryEmbedding(Module):
+    def __init__(self, max_period: float | int = 10_000.0):
+        super().__init__()
+        self.max_period = float(max_period)
 
+    def __call__(
+        self, q: TensorValue, k: TensorValue, offset: TensorValue
+    ) -> tuple[TensorValue, TensorValue]:
+        """Apply RoPE rotation to q and k.
+
+        Args:
+            q: (B, T, H, D) query tensor.
+            k: (B, T, H, D) key tensor.
+            offset: scalar long tensor — number of past positions before this
+                slice (RoPE position offset).
+
+        Returns:
+            Rotated (q, k) with the same shapes/dtypes as inputs.
+        """
+        return _apply_rope(q, k, offset=offset, max_period=self.max_period)
+
+
+def _apply_rope(
+    q: TensorValue, k: TensorValue, offset: TensorValue, max_period: float
+) -> tuple[TensorValue, TensorValue]:
     B, T, H, D = q.shape
     Bk, Tk, Hk, Dk = k.shape
-    assert (B, T, D) == (Bk, Tk, Dk)
-    assert D > 0
-    assert D % 2 == 0
-    assert max_period > 0
+    assert int(D) == int(Dk)
+    assert int(D) % 2 == 0
+    D_int = int(D)
+    half = D_int // 2
 
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    device = q.device
 
-    # could be optimized in one call
-    ts = torch.arange(T, device=q.device, dtype=torch.float32)
-    ts += offset
-    ts = ts.view(-1, 1, 1)
+    # Frequencies depend only on D and max_period (compile-time constant).
+    ds = np.arange(half, dtype=np.float32)
+    freqs_np = np.exp(ds * (-math.log(max_period) * 2.0 / D_int))
+    freqs = ops.constant(freqs_np, DType.float32, device)
 
-    q = q.view(B, T, H, D // 2, 2)
-    k = k.view(B, T, Hk, D // 2, 2)
+    # Positions: offset + arange(T). We build the range dynamically from T
+    # (which may be a symbolic dim).
+    ts = ops.range(
+        ops.constant(0, DType.int64, DeviceRef.CPU()),
+        T,
+        ops.constant(1, DType.int64, DeviceRef.CPU()),
+        out_dim=T,
+        dtype=DType.int64,
+        device=device,
+    )
+    offset_cpu = ops.cast(offset, DType.int64).reshape(())
+    if offset_cpu.device != device:
+        offset_cpu = offset_cpu.to(device)
+    ts = ts + offset_cpu
+    ts = ops.cast(ts, DType.float32)
+    ts = ops.unsqueeze(ts, -1)  # (T, 1)
 
-    # convention is `r` suffix is real part, `i` is imaginary.
-    qr = q[..., 0].float()
-    qi = q[..., 1].float()
+    angles = ts * freqs  # (T, half)
+    rotr = ops.cos(angles)
+    roti = ops.sin(angles)
+    # Broadcast helpers: (1, T, 1, half)
+    rotr = ops.unsqueeze(ops.unsqueeze(rotr, 1), 0)
+    roti = ops.unsqueeze(ops.unsqueeze(roti, 1), 0)
 
-    kr = k[..., 0].float()
-    ki = k[..., 1].float()
+    def _rotate(x: TensorValue) -> TensorValue:
+        # x: (B, T, H, D) → split last dim into pairs.
+        x_pairs = ops.reshape(x, (x.shape[0], x.shape[1], x.shape[2], half, 2))
+        xr = x_pairs[..., 0]
+        xi = x_pairs[..., 1]
+        cosv = ops.cast(rotr, x.dtype)
+        sinv = ops.cast(roti, x.dtype)
+        xor_ = xr * cosv - xi * sinv
+        xoi_ = xr * sinv + xi * cosv
+        out = ops.stack([xor_, xoi_], axis=-1)
+        return ops.reshape(out, x.shape)
 
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
-    qor = qr * rotr - qi * roti
-    qoi = qr * roti + qi * rotr
-
-    kor = kr * rotr - ki * roti
-    koi = kr * roti + ki * rotr
-
-    dtype = q.dtype
-    qo = torch.stack([qor.to(dtype), qoi.to(dtype)], dim=-1)
-    ko = torch.stack([kor.to(dtype), koi.to(dtype)], dim=-1)
-
-    return qo.view(B, T, H, D), ko.view(B, T, Hk, D)
-
-
-class RotaryEmbedding(nn.Module):
-    """Rotary positional embedding (RoPE) from [Su et al 2022](https://arxiv.org/abs/2104.09864).
-
-    Args:
-        max_period (float): Maximum period of the rotation frequencies.
-    """
-
-    def __init__(self, max_period: float | int = 10000.0):
-        super().__init__()
-        self.max_period = max_period
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, offset: torch.Tensor | int):
-        """Apply rope rotation to query or key tensor."""
-        return apply_rope(q, k, offset, self.max_period)
+    return _rotate(q), _rotate(k)

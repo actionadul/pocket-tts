@@ -12,8 +12,8 @@ def test_readme_example():
     tts_model = TTSModel.load_model()
     voice_state = tts_model.get_state_for_audio_prompt("cosette")
     audio = tts_model.generate_audio(voice_state, "Hello world, this is a test.")
-    # Audio is a torch tensor containing PCM data.
-    scipy.io.wavfile.write("output.wav", tts_model.sample_rate, audio.numpy())
+    # Audio is a numpy array containing PCM data.
+    scipy.io.wavfile.write("output.wav", tts_model.sample_rate, audio)
 
 
 def test_quick_start():
@@ -31,7 +31,7 @@ def test_quick_start():
     audio = tts_model.generate_audio(voice_state, "Hello world, this is a test.")
 
     # Save to file
-    scipy.io.wavfile.write("output.wav", tts_model.sample_rate, audio.numpy())
+    scipy.io.wavfile.write("output.wav", tts_model.sample_rate, audio)
 
 
 def test_load_model():
@@ -40,9 +40,9 @@ def test_load_model():
     # Load with default settings
     model = TTSModel.load_model()
 
-    # Load with custom parameters
+    # Load with custom parameters (lsd_decode_steps must be 1 in the MAX port).
     model = TTSModel.load_model(
-        language="english_2026-01", temp=0.5, lsd_decode_steps=5, eos_threshold=-3.0
+        language="english_2026-01", temp=0.5, lsd_decode_steps=1, eos_threshold=-3.0
     )
 
 

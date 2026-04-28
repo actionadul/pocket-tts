@@ -7,8 +7,6 @@ readme = "README.md"
 dependencies = [
     "max",
     "numpy>=2",
-    # I tried 2.4.0 but the generated audio is wrong, so 2.5+ is needed.
-    "torch>=2.5.0",
     "pydantic>=2",
     "sentencepiece>=0.2.1",
     "beartype>=0.22.5",
@@ -26,7 +24,6 @@ dependencies = [
 
 [project.optional-dependencies]
 audio = ["soundfile>=0.12.0"]
-quantize = ["torchao>=0.16.0"]
 
 
 [dependency-groups]
@@ -53,9 +50,6 @@ dev = [
 
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cpu" },
-]
 max = [
     { index = "modular-nightly" },
 ]
@@ -87,12 +81,6 @@ mojo-compiler-mojo-libs = [
 [[tool.uv.index]]
 name = "modular-nightly"
 url = "https://whl.modular.com/nightly/simple/"
-explicit = true
-
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.ruff]

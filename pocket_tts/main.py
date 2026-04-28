@@ -291,7 +291,12 @@ def generate(
             eos_threshold=eos_threshold,
             quantize=quantize,
         )
-        tts_model.to(device)
+        if device != "cpu":
+            logger.warning(
+                "Device %r requested, but the MAX backend currently runs on CPU only;"
+                " continuing on CPU.",
+                device,
+            )
 
         model_state_for_voice = tts_model.get_state_for_audio_prompt(voice)
         # Stream audio generation directly to file or stdout

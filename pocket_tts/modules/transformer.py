@@ -1,151 +1,188 @@
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
+"""Streaming multi-head attention with a per-layer KV cache.
+
+The cache is held *functionally*: K and V are inputs to the graph, and
+appended-K, appended-V are outputs. The Python orchestrator threads them
+between calls. RoPE position offset is also tracked explicitly.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from max.dtype import DType
+from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.nn import Module
 
 from pocket_tts.modules.rope import RotaryEmbedding
 from pocket_tts.modules.stateful_module import StatefulModule
 
 
-def complete_kv(
-    cache: torch.Tensor, offset: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if offset.numel() > 1 and not torch.all(offset == offset.view(-1)[0]):
-        raise ValueError("Linear cache offset must be identical across batch.")
-    offset_value = int(offset.view(-1)[0].item())
-
-    cache[0, :, offset_value : offset_value + k.shape[1]] = k
-    cache[1, :, offset_value : offset_value + v.shape[1]] = v
-    valid = cache[:, :, : offset_value + k.shape[1]]
-    return valid[0], valid[1]
-
-
 def _build_attention_mask(
-    pos_q: torch.Tensor, pos_k: torch.Tensor, context: int | None
-) -> torch.Tensor:
-    delta = pos_q[:, :, None] - pos_k[:, None, :]
-    mask = (pos_k[:, None, :] >= 0) & (delta >= 0)
+    pos_q: TensorValue, pos_k: TensorValue, context: int | None
+) -> TensorValue:
+    """Mirror of legacy `_build_attention_mask`.
+
+    Args:
+        pos_q: (1, T_q) int positions.
+        pos_k: (1, T_k) int positions.
+        context: optional sliding-window context width.
+
+    Returns:
+        Mask of shape (1, 1, T_q, T_k), True where attention is allowed.
+    """
+    delta = ops.unsqueeze(pos_q, 2) - ops.unsqueeze(pos_k, 1)  # (1, T_q, T_k)
+    pos_k_b = ops.unsqueeze(pos_k, 1)  # (1, 1, T_k)
+    nonneg_k = pos_k_b >= ops.constant(0, pos_k.dtype, pos_k.device)
+    causal = delta >= ops.constant(0, delta.dtype, delta.device)
+    mask = nonneg_k & causal
     if context is not None:
-        mask = mask & (delta < context)
-    return mask[:, None]
+        mask = mask & (delta < ops.constant(context, delta.dtype, delta.device))
+    return ops.unsqueeze(mask, 1)  # (1, 1, T_q, T_k)
 
 
-# Per-layer streaming state schemas (returned by init_state and stored in model_state):
-# - Linear cache (FlowLM / full causal):
-#   - offset: torch.long[B]  # absolute time index for the next write / RoPE offset
-#                            # (batch must be in sync)
-#   - cache:  torch.[dtype][2, B, T, H, D]  # K/V stored contiguously along T (allocated capacity)
+class _StackedInProj(Module):
+    """Linear with weight named `weight` matching legacy `self_attn.in_proj.weight`.
+
+    Output dim is `3 * embed_dim` (Q | K | V interleaved).
+    """
+
+    def __init__(self, embed_dim: int, dtype: DType, device: DeviceRef) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.weight = Weight("weight", dtype, [3 * embed_dim, embed_dim], device=device)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return x @ ops.transpose(self.weight, 0, 1)
 
 
-class _LinearKVCacheBackend:
-    requires_state = True
+class _LinearNoBias(Module):
+    """Linear w/o bias whose weight is named `weight`."""
 
-    def __init__(self, num_heads: int, dim_per_head: int):
-        self.num_heads = num_heads
-        self.dim_per_head = dim_per_head
+    def __init__(self, in_dim: int, out_dim: int, dtype: DType, device: DeviceRef) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.weight = Weight("weight", dtype, [out_dim, in_dim], device=device)
 
-    def init_state(
-        self, batch_size: int, sequence_length: int, device: torch.device, dtype: torch.dtype
-    ) -> dict[str, torch.Tensor]:
-        return dict(
-            offset=torch.zeros(batch_size, dtype=torch.long, device=device),
-            cache=torch.full(
-                (2, batch_size, sequence_length, self.num_heads, self.dim_per_head),
-                float("NaN"),
-                device=device,
-                dtype=dtype,
-            ),
-        )
-
-    def increment_step(self, state: dict[str, torch.Tensor], increment: int) -> None:
-        state["offset"] += increment
-
-    def rope_offset(
-        self, state: dict[str, torch.Tensor] | None, batch_size: int, device: torch.device
-    ) -> torch.Tensor:
-        if state is None:
-            return torch.zeros((), dtype=torch.long, device=device)
-        return state["offset"].view(-1)[0]
-
-    def append_and_get(
-        self, k: torch.Tensor, v: torch.Tensor, state: dict[str, torch.Tensor] | None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if state is None:
-            k_attn = k.permute(0, 2, 1, 3)
-            v_attn = v.permute(0, 2, 1, 3)
-            pos_k = torch.arange(k_attn.shape[2], device=k_attn.device, dtype=torch.long)
-            pos_k = pos_k.view(1, -1).expand(k_attn.shape[0], -1)
-            offset = torch.zeros(k_attn.shape[0], device=k_attn.device, dtype=torch.long)
-            return k_attn, v_attn, pos_k, offset
-        cache_k, cache_v = complete_kv(state["cache"], state["offset"], k, v)
-        k_attn = cache_k.permute(0, 2, 1, 3)
-        v_attn = cache_v.permute(0, 2, 1, 3)
-        pos_k = torch.arange(k_attn.shape[2], device=k_attn.device, dtype=torch.long)
-        pos_k = pos_k.view(1, -1).expand(k_attn.shape[0], -1)
-        return k_attn, v_attn, pos_k, state["offset"]
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return x @ ops.transpose(self.weight, 0, 1)
 
 
 class StreamingMultiheadAttention(StatefulModule):
-    """Similar to `nn.MultiheadAttention` but with support for streaming.
+    """Self-attention with rolling KV cache.
 
-    Args:
-        embed_dim (int): Dimension to project to.
-        num_heads (int): Number of heads.
-        context (int, optional): Number of time steps the attention can access to.
-            Can access `context` time steps into the past.
-        rope (`RotaryEmbedding`, optional): Rope embedding to use.
-        device (torch.device, optional): Device on which to initialize.
-        dtype (torch.dtype, optional): dtype to use.
+    State schema: {"k": (B, T_past, H, D), "v": (B, T_past, H, D),
+    "offset": (B,) int64}.
     """
 
     def __init__(
-        self, embed_dim: int, num_heads: int, rope: RotaryEmbedding, context: int | None = None
+        self,
+        embed_dim: int,
+        num_heads: int,
+        rope: RotaryEmbedding,
+        context: int | None = None,
+        dtype: DType = DType.float32,
+        device: DeviceRef | None = None,
     ):
         super().__init__()
-
         self.embed_dim = embed_dim
-        self.rope = rope
         self.num_heads = num_heads
-        self.context = context
         self.dim_per_head = embed_dim // num_heads
-        self._cache_backend = _LinearKVCacheBackend(self.num_heads, self.dim_per_head)
+        self.context = context
+        self.rope = rope
+        self._device = device or DeviceRef.CPU()
+        self.dtype = dtype
 
-        out_dim = embed_dim
-        num_kv = num_heads
-        kv_dim = (embed_dim // num_heads) * num_kv
-        out_dim += 2 * kv_dim
-        mult = 1
-        self.in_proj = nn.Linear(embed_dim, mult * out_dim, bias=False)
-        self.out_proj = nn.Linear(embed_dim, mult * embed_dim, bias=False)
+        self.in_proj = _StackedInProj(embed_dim, dtype, self._device)
+        self.out_proj = _LinearNoBias(embed_dim, embed_dim, dtype, self._device)
 
-    def init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
-        device = self.in_proj.weight.device
-        dtype = self.in_proj.weight.dtype
-        return self._cache_backend.init_state(batch_size, sequence_length, device, dtype)
+    def init_state(self, batch_size: int, sequence_length: int) -> dict[str, np.ndarray]:
+        np_dtype = self.dtype.to_numpy()
+        return {
+            "k": np.zeros((batch_size, 0, self.num_heads, self.dim_per_head), dtype=np_dtype),
+            "v": np.zeros((batch_size, 0, self.num_heads, self.dim_per_head), dtype=np_dtype),
+            "offset": np.zeros((batch_size,), dtype=np.int64),
+        }
 
-    def increment_step(self, state: dict, increment: int = 1):
-        self._cache_backend.increment_step(state, increment)
+    def increment_step(self, state: dict[str, np.ndarray], increment: int = 1) -> None:
+        state["offset"] = state["offset"] + increment
 
-    def forward(self, query: torch.Tensor, model_state: dict | None):
-        state = None if model_state is None else self.get_state(model_state)
+    def __call__(self, query: TensorValue, model_state) -> TensorValue:
+        B, T, _ = query.shape
+        H = self.num_heads
+        D = self.dim_per_head
 
         projected = self.in_proj(query)
-        # Reshape from (b, t, p*h*d) to (b, t, p, h, d) where p=3, h=num_heads
-        b, t, _ = projected.shape
-        d = self.dim_per_head
-        packed = projected.view(b, t, 3, self.num_heads, d)
-        q, k, v = torch.unbind(packed, dim=2)
-        rope_offset = self._cache_backend.rope_offset(state, b, q.device)
-        q, k = self.rope(q, k, offset=rope_offset)
-        q = q.transpose(1, 2)
+        # Split out Q | K | V along the last axis, then reshape to (B, T, H, D).
+        q_, k_, v_ = ops.split(projected, [self.embed_dim, self.embed_dim, self.embed_dim], axis=-1)
+        q = ops.reshape(q_, (B, T, H, D))
+        k = ops.reshape(k_, (B, T, H, D))
+        v = ops.reshape(v_, (B, T, H, D))
 
-        k_attn, v_attn, pos_k, offset = self._cache_backend.append_and_get(k, v, state)
-        pos_q = offset.view(-1, 1) + torch.arange(t, device=q.device, dtype=torch.long).view(1, -1)
+        if model_state is None:
+            offset_scalar = ops.constant(0, DType.int64, query.device)
+            q, k = self.rope(q, k, offset=offset_scalar)
+            k_attn = ops.transpose(k, 1, 2)  # (B, H, T_k, D)
+            v_attn = ops.transpose(v, 1, 2)
+            T_k = k.shape[1]
+            pos_k = ops.range(
+                ops.constant(0, DType.int64, DeviceRef.CPU()),
+                T_k,
+                ops.constant(1, DType.int64, DeviceRef.CPU()),
+                out_dim=T_k,
+                dtype=DType.int64,
+                device=query.device,
+            )
+            pos_k = ops.unsqueeze(pos_k, 0)  # (1, T_k)
+            offset_per_b = ops.broadcast_to(offset_scalar, shape=(B,))
+        else:
+            state = self.get_state(model_state)
+            offset_t = state["offset"]
+            offset_scalar = ops.cast(offset_t, DType.int64).reshape(())
+            q, k = self.rope(q, k, offset=offset_scalar)
+            k_full = ops.concat([state["k"], k], axis=1)
+            v_full = ops.concat([state["v"], v], axis=1)
+            state["k"] = k_full
+            state["v"] = v_full
+            k_attn = ops.transpose(k_full, 1, 2)
+            v_attn = ops.transpose(v_full, 1, 2)
+            T_k = k_full.shape[1]
+            pos_k = ops.range(
+                ops.constant(0, DType.int64, DeviceRef.CPU()),
+                T_k,
+                ops.constant(1, DType.int64, DeviceRef.CPU()),
+                out_dim=T_k,
+                dtype=DType.int64,
+                device=query.device,
+            )
+            pos_k = ops.unsqueeze(pos_k, 0)
+            offset_per_b = state["offset"]
+
+        # pos_q = offset + arange(T)
+        arange_q = ops.range(
+            ops.constant(0, DType.int64, DeviceRef.CPU()),
+            T,
+            ops.constant(1, DType.int64, DeviceRef.CPU()),
+            out_dim=T,
+            dtype=DType.int64,
+            device=query.device,
+        )
+        pos_q = ops.unsqueeze(offset_per_b, 1) + ops.unsqueeze(arange_q, 0)
         attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
-        x = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask, dropout_p=0.0)
-        x = x.transpose(1, 2)
-        # Reshape from (b, t, h, d) to (b, t, h*d)
-        b, t, h, d = x.shape
-        x = x.reshape(b, t, h * d)
-        x = self.out_proj(x)
 
-        return x
+        q_t = ops.transpose(q, 1, 2)  # (B, H, T, D)
+        scale = 1.0 / math.sqrt(D)
+        scores = q_t @ ops.transpose(k_attn, 2, 3)  # (B, H, T_q, T_k)
+        scores = scores * ops.constant(scale, scores.dtype, scores.device)
+        # Apply mask: where mask is False, set scores to a very-negative finite
+        # value. We avoid -inf because the MAX compiler fuses softmax with
+        # ``where(..., -inf)`` in a way that produces NaN downstream when the
+        # intermediate isn't materialised.
+        neg_huge = ops.constant(-1e30, scores.dtype, scores.device)
+        scores = ops.where(attn_mask, scores, neg_huge)
+        weights = ops.softmax(scores, axis=-1)
+        attn_out = weights @ v_attn  # (B, H, T_q, D)
+        attn_out = ops.transpose(attn_out, 1, 2)  # (B, T_q, H, D)
+        attn_out = ops.reshape(attn_out, (B, T, self.embed_dim))
+        return self.out_proj(attn_out)

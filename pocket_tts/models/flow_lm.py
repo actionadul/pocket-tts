@@ -1,58 +1,43 @@
-import logging
-from functools import partial
+"""Flow language model on a transformer backbone, MAX implementation."""
 
-import torch
-from beartype.typing import Callable
-from torch import nn
+from __future__ import annotations
+
+import logging
+
+from max.dtype import DType
+from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.nn import Module
 from typing_extensions import Self
 
 from pocket_tts.conditioners.text import LUTConditioner
-from pocket_tts.modules.mimi_transformer import StreamingTransformer
+from pocket_tts.modules.mimi_transformer import StreamingTransformer, _LayerNorm, _LinearNoBias
 from pocket_tts.modules.mlp import SimpleMLPAdaLN
+from pocket_tts.modules.transformer import _LinearNoBias as _LinearNoBiasNoBias  # noqa: F401
 from pocket_tts.utils.config import FlowLMConfig
 
 logger = logging.getLogger(__name__)
 
-FlowNet2 = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+
+class _LinearWithBias(Module):
+    """Linear with bias, weight named `weight`, bias named `bias`."""
+
+    def __init__(self, in_dim: int, out_dim: int, dtype: DType, device: DeviceRef) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.weight = Weight("weight", dtype, [out_dim, in_dim], device=device)
+        self.bias = Weight("bias", dtype, [out_dim], device=device)
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        return x @ ops.transpose(self.weight, 0, 1) + self.bias
 
 
-def lsd_decode(v_t: FlowNet2, x_0: torch.Tensor, num_steps: int = 1) -> torch.Tensor:
-    """Rebuilds the data sample from starting point x_0.
-
-    Lagrangian Self Distillation (https://arxiv.org/pdf/2505.18825)
-
-    Args:
-        v_t: Function taking t and x_t as input and returning the flow.
-        x_0: Starting point from the known distribution.
-        num_steps: Number of steps to take.
-
-    Returns:
-        x_1_hat: (B, D) Reconstructed data sample.
-    """
-    current = x_0
-    for i in range(num_steps):
-        s = i / num_steps
-        t = (i + 1) / num_steps
-        flow_dir = v_t(
-            s * torch.ones_like(x_0[..., :1]), t * torch.ones_like(x_0[..., :1]), current
-        )
-        current += flow_dir / num_steps
-    return current
-
-
-class FlowLMModel(nn.Module):
+class FlowLMModel(Module):
     """Transformer-based flow language model on multiple streams of latents.
 
-    Args:
-        conditioner (LUTConditioner): Text conditioner for processing text inputs.
-        flow: Flow module that defines the flow loss and sampling strategy.
-        flow_net: Trainable function (cond, t, x_t) -> u_t.
-        dim (int): Dimension of the transformer encoder.
-        norm (str): Normalization method.
-        attribute_dropouts (dict): Attribute dropout probabilities.
-        ldim (int): Latent dimension.
-        stats_ema_decay (float): Decay for the EMA of the latent statistics.
-        **kwargs: Additional parameters for the transformer encoder.
+    This module composes the conditioner, transformer backbone and flow MLP
+    just like the legacy implementation. Method names mirror the original
+    so the orchestrator code can be ported with minimal changes.
     """
 
     def __init__(
@@ -62,155 +47,143 @@ class FlowLMModel(nn.Module):
         transformer: StreamingTransformer,
         dim: int = 128,
         ldim: int = 64,
-        stats_ema_decay: float = 0.999,
         text_padding_weight: float = 1.0,
-        dtype=None,
+        dtype: DType = DType.float32,
+        device: DeviceRef | None = None,
         insert_bos_before_voice: bool = False,
     ):
         super().__init__()
         self.conditioner = conditioner
         self.ldim = ldim
-        self.stats_ema_decay = stats_ema_decay
         self.dim = dim
         self.text_padding_weight = text_padding_weight
         self.dtype = dtype
+        self._device = device or DeviceRef.CPU()
+        self.insert_bos_before_voice = insert_bos_before_voice
 
         self.flow_net = flow_net
-        self.register_buffer("emb_std", torch.ones(ldim, dtype=dtype))
-        self.register_buffer("emb_mean", torch.zeros(ldim, dtype=dtype))
-        self.bos_emb = torch.nn.Parameter(torch.randn(ldim, dtype=dtype))
-        self.insert_bos_before_voice = insert_bos_before_voice
-        if self.insert_bos_before_voice:
-            # Add BOS value that's to be inserted before the voice condition
-            self.bos_before_voice = torch.nn.Parameter(torch.randn((1, 1, self.dim), dtype=dtype))
+        # `emb_std` and `emb_mean` are torch buffers in the legacy code; here
+        # they are simple Weights so the safetensors load registers them.
+        self.emb_std = Weight("emb_std", dtype, [ldim], device=self._device)
+        self.emb_mean = Weight("emb_mean", dtype, [ldim], device=self._device)
+        self.bos_emb = Weight("bos_emb", dtype, [ldim], device=self._device)
 
-        self.input_linear = nn.Linear(self.ldim, dim, bias=False, dtype=dtype)
-        self.transformer = transformer
-        self.out_norm = nn.LayerNorm(dim, eps=1e-5)
-        self.out_eos = nn.Linear(dim, 1, dtype=dtype)
+        if insert_bos_before_voice:
+            self.bos_before_voice = Weight(
+                "bos_before_voice", dtype, [1, 1, dim], device=self._device
+            )
 
-    @property
-    def device(self) -> str:
-        return next(self.parameters()).device.type
-
-    def forward(
-        self,
-        sequence: torch.Tensor,
-        text_embeddings: torch.Tensor,
-        model_state: dict,
-        lsd_decode_steps: int,
-        temp: float,
-        noise_clamp: float | None,
-        eos_threshold: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply language model on sequence and conditions.
-        Given a tensor of sequence of shape [B, S, ldim], returns the loss in training mode
-        or the reconstructed latent in generation mode.
-
-        Args:
-            sequence (torch.Tensor): Latents to model.
-            text_embeddings (torch.Tensor): Pre-computed conditioning
-                tensor.
-            lsd_decode_steps (int): Number of steps to decode when generating audio.
-                If zero, the model computes the loss.
-        Returns:
-            (output, eos_output, metrics). If `lsd_decode_steps` is zero, `output` is the loss tensor of shape [B, S],
-            otherwise it is the reconstructed latent.
-        """
-        # NaN values signal a BOS position.
-        sequence = torch.where(torch.isnan(sequence), self.bos_emb, sequence)
-        input_ = self.input_linear(sequence)
-
-        transformer_out = self.backbone(input_, text_embeddings, sequence, model_state=model_state)
-        transformer_out = transformer_out.to(torch.float32)
-        assert lsd_decode_steps > 0
-
-        transformer_out = transformer_out[:, -1]
-        out_eos = self.out_eos(transformer_out) > eos_threshold
-
-        noise_shape = transformer_out.shape[:-1] + (self.ldim,)
-        std = temp**0.5
-        noise = torch.empty(noise_shape, dtype=transformer_out.dtype, device=transformer_out.device)
-        if noise_clamp is None:
-            torch.nn.init.normal_(noise, mean=0.0, std=std)
-        else:
-            torch.nn.init.trunc_normal_(noise, mean=0.0, std=std, a=-noise_clamp, b=noise_clamp)
-        conditioned_flow = partial(self.flow_net, transformer_out)
-        return lsd_decode(conditioned_flow, noise, lsd_decode_steps), out_eos
-
-    def backbone(
-        self, input_, text_embeddings: torch.Tensor, sequence, model_state: dict
-    ) -> torch.Tensor:
-        # Most of the time, one of those two tensors is empty, it allows us
-        # to input text or audio embeddings into the model without adding an
-        # if-else branch.
-        # print("text_embeddings shape:", text_embeddings.shape)
-        # if text_embeddings.numel() != 0:
-        #     torch.save(text_embeddings, "debug_flow_lm_text_embeddings.pt")
-        input_ = torch.cat([text_embeddings, input_], dim=1)
-        # transformer_out = self.transformer(input_, model_state=model_state)
-        transformer_out = self.transformer(input_, model_state)
-        if self.out_norm:
-            transformer_out = self.out_norm(transformer_out)
-        # remove the prefix from the model outputs (condition is prepended)
-        transformer_out = transformer_out[:, -sequence.shape[1] :]
-        return transformer_out
-
-    def _sample_next_latent(
-        self,
-        sequence: torch.Tensor,
-        text_embeddings: torch.Tensor,
-        model_state: dict,
-        lsd_decode_steps: int,
-        temp: float,
-        noise_clamp: float | None,
-        eos_threshold: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample next latent from the model given a sequence and a set of conditions.
-        Args:
-            sequence (torch.Tensor): Current sequence of shape [B, K, S]
-                with K corresponding to the number of codebooks and S the number of sequence steps.
-                S = 1 in streaming mode, except for the first step that contains a bigger prompt.
-            text_embeddings (torch.Tensor): Condition tensor.
-            n_steps (int): Number of flow steps to decode when generating audio.
-        Returns:
-            next_latent (torch.Tensor), is_eos (torch.Tensor): Next latent tensor of shape [B, 1, ldim]
-                and is_eos tensor of shape [B, 1] with 1 on EOS positions.
-        """
-        result = self(
-            sequence=sequence,
-            text_embeddings=text_embeddings,
-            lsd_decode_steps=lsd_decode_steps,
-            temp=temp,
-            noise_clamp=noise_clamp,
-            eos_threshold=eos_threshold,
-            model_state=model_state,
+        # Initialised at load time (legacy: `tts_model.flow_lm.speaker_proj_weight`).
+        self.speaker_proj_weight = Weight(
+            "speaker_proj_weight", dtype, [dim, dim], device=self._device
         )
 
-        return result
+        self.input_linear = _LinearNoBias(ldim, dim, dtype=dtype, device=self._device)
+        self.transformer = transformer
+        self.out_norm = _LayerNorm(dim, eps=1e-5, dtype=dtype)
+        self.out_eos = _LinearWithBias(dim, 1, dtype=dtype, device=self._device)
+
+    def __call__(self, *args, **kwargs):  # pragma: no cover
+        raise RuntimeError("FlowLMModel is not directly callable; use backbone_run_* helpers.")
 
     @classmethod
     def from_pydantic_config(
-        cls, config: FlowLMConfig, latent_dim: int, insert_bos_before_voice: bool
+        cls,
+        config: FlowLMConfig,
+        latent_dim: int,
+        insert_bos_before_voice: bool,
+        speaker_proj_in_dim: int,
+        dtype: DType = DType.float32,
+        device: DeviceRef | None = None,
     ) -> Self:
         d_model = config.transformer.d_model
-        flow_mlp = SimpleMLPAdaLN.from_pydantic_config(config, latent_dim, d_model)
-
+        flow_mlp = SimpleMLPAdaLN.from_pydantic_config(
+            config, latent_dim, d_model, dtype=dtype, device=device
+        )
         conditioner = LUTConditioner(
             n_bins=config.lookup_table.n_bins,
             tokenizer_path=str(config.lookup_table.tokenizer_path),
             dim=config.lookup_table.dim,
             output_dim=d_model,
+            dtype=dtype,
+            device=device,
         )
-
-        transformer = StreamingTransformer.from_pydantic_config(config.transformer)
-
-        return cls(
+        transformer = StreamingTransformer.from_pydantic_config(
+            config.transformer, dtype=dtype, device=device
+        )
+        # speaker_proj_weight in the legacy code maps from
+        # `mimi.inner_dim or mimi.seanet.dimension` -> `flow_lm.transformer.d_model`.
+        # We reshape it on construction.
+        instance = cls(
             flow_net=flow_mlp,
             transformer=transformer,
-            dim=d_model,
             conditioner=conditioner,
+            dim=d_model,
             ldim=latent_dim,
-            dtype=getattr(torch, config.dtype),
+            dtype=dtype,
+            device=device,
             insert_bos_before_voice=insert_bos_before_voice,
         )
+        # Resize speaker_proj_weight to (d_model, speaker_proj_in_dim).
+        instance.speaker_proj_weight = Weight(
+            "speaker_proj_weight", dtype, [d_model, speaker_proj_in_dim], device=instance._device
+        )
+        return instance
+
+    # ------------------------------------------------------------------ #
+    # Graph-level helpers used by the compiled graphs.
+    # ------------------------------------------------------------------ #
+
+    def backbone_run_prompt_text(self, text_tokens: TensorValue, model_state) -> None:
+        """Run the transformer over text-token embeddings, updating kv cache.
+
+        Returns nothing — only the kv-cache update inside `model_state` matters.
+        """
+        text_emb = self.conditioner.embed(text_tokens)
+        # Pass through the transformer to update KV state.
+        _ = self.transformer(text_emb, model_state)
+
+    def backbone_run_prompt_audio(self, audio_cond: TensorValue, model_state) -> None:
+        _ = self.transformer(audio_cond, model_state)
+
+    def backbone_run_gen_step(
+        self, backbone_input: TensorValue, model_state, noise: TensorValue
+    ) -> tuple[TensorValue, TensorValue]:
+        """One autoregressive step.
+
+        Args:
+            backbone_input: (1, 1, ldim) latent (NaN positions are replaced
+                with `bos_emb`).
+            model_state: kv-cache state for the transformer.
+            noise: pre-sampled (1, ldim) Gaussian noise. Caller scales by
+                temperature/clamp before passing in.
+
+        Returns:
+            (next_latent, eos_logit) — `eos_logit` is the raw logit; the caller
+            applies the threshold.
+        """
+        is_nan = ops.is_nan(backbone_input)
+        bos_b = ops.broadcast_to(self.bos_emb, shape=backbone_input.shape)
+        sequence = ops.where(is_nan, bos_b, backbone_input)
+        input_ = self.input_linear(sequence)
+        transformer_out = self.transformer(input_, model_state)
+        # The legacy backbone applies `out_norm` to the transformer output
+        # *before* slicing to the last token; mirror that here.
+        transformer_out = self.out_norm(transformer_out)
+        transformer_out = ops.cast(transformer_out, DType.float32)
+        # transformer_out shape: (1, 1, dim) — squeeze the sequence dim.
+        transformer_last = ops.squeeze(transformer_out, 1)  # (1, dim)
+        eos_logit = self.out_eos(transformer_last)  # (1, 1)
+        next_latent = lsd_decode_one_step(self.flow_net, transformer_last, noise)
+        return next_latent, eos_logit
+
+
+def lsd_decode_one_step(
+    flow_net: SimpleMLPAdaLN, cond: TensorValue, x_0: TensorValue
+) -> TensorValue:
+    """Single LSD step (num_steps == 1). Returns the predicted x_1."""
+    device = x_0.device
+    s = ops.broadcast_to(ops.constant(0.0, x_0.dtype, device), shape=(x_0.shape[0], 1))
+    t = ops.broadcast_to(ops.constant(1.0, x_0.dtype, device), shape=(x_0.shape[0], 1))
+    flow_dir = flow_net(cond, s, t, x_0)
+    return x_0 + flow_dir
