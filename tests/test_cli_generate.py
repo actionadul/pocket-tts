@@ -154,14 +154,7 @@ def test_generate_long_text_with_teacher_forcing(tmp_path):
 
     result = runner.invoke(
         cli_app,
-        [
-            "generate",
-            "--text",
-            long_text,
-            "--teacher-forcing",
-            "--output-path",
-            str(output_file),
-        ],
+        ["generate", "--text", long_text, "--teacher-forcing", "--output-path", str(output_file)],
     )
 
     assert result.exit_code == 0
