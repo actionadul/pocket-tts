@@ -69,10 +69,12 @@ This is a pure Python package with Rust extensions in `training/rust_exts/audio_
 - `seanet.py`: SEANet encoder/decoder (copied from moshi)
 
 **Conditioners (`conditioners/`):**
-- `text.py`: `LUTConditioner` - SentencePiece-based text tokenizer that converts input text to embeddings
+- `text.py`: `LUTConditioner` - SentencePiece-based text tokenizer that converts input text to token embeddings
 
 ## Personal Notes
 
-> **Fork purpose:** I'm using this repo to learn about flow-matching TTS architectures and experiment with
-> voice prompt caching behavior. The LRU cache in `tts_model.py` is particularly interesting to me —
-> worth exploring whether cache size (`maxsize`) is worth tuning for multi-speaker use cases.
+> These are my own notes from exploring this codebase — not part of the upstream project.
+
+- The LRU cache in `tts_model.py` for voice prompts is a nice touch; worth checking the default cache size if memory is tight on low-RAM machines.
+- `default_parameters.py` is the first place to look if you want to tweak generation speed vs. quality tradeoffs.
+- The `seanet.py` file is copied from `moshi` — don't bother trying to understand it in isolation; read the moshi repo alongside it.
